@@ -133,7 +133,7 @@
 | Размер контекста | `<CTX>` | веса, KV-квант, раскладка |
 | Вариант рантайма/сборки | `<RUNTIME>` (baseline vs патч) | модель, KV, `<CTX>`, раскладка |
 | Порядок устройств | `--device` (порядок карт) | всё остальное; проверять байт-идентичность вывода |
-| Prompt-кеш | `cache_prompt` (`true`/`false`) | веса, KV, `<CTX>`, раскладка; при `false` — инвариант `cache_hit ≈ 0` |
+| Prompt-кеш | `cache_prompt` (`true`/`false`) | веса, KV, `<CTX>`, раскладка; при `false` — инвариант `cache_hit ≈ 0` (проверяется раннером, раздел 4.4) |
 
 **Правило одного изменения.** Одно сравнение — ровно одно различие. Если свип
 меняет несколько параметров сразу, это **конфаунд**: его вклад не отделён, и
@@ -186,9 +186,16 @@
   не сравнивать.
 - **Опциональный cold-режим.** Профиль может задавать `cache_prompt = false`
   (настраиваемая ось, раздел 3). Тогда действует жёсткий инвариант
-  `cache_hit ≈ 0` на всех ступенях; при его невыполнении ступень помечается
-  `non_comparable`. Cold-режим не расширять до полного протокола — только как
-  отдельная ось сравнения.
+  `cache_hit ≈ 0` на всех ступенях. Инвариант проверяется автоматически
+  раннером (`step_comparable_reason` в `scripts/runner/run_cache_sessions.py`):
+  при `cache_prompt = false` ступень **не comparable**, если
+  `cache_hit_fraction > cold_cache_hit_tolerance` (причина
+  `cold_cache_hit_exceeded`), а также если cache-hit неизвестен (причина
+  `cold_cache_hit_unknown`, fail-closed: без измерения инвариант не
+  подтверждён). Порог берётся из профиля (`cold_cache_hit_tolerance`, дефолт
+  `0.005`) и записывается в `result.json`; ступень несёт
+  `step_comparable_reason`. Cold-режим не расширять до полного протокола —
+  только как отдельная ось сравнения.
 
 ### 4.5. Адаптация под свой `<CTX>`
 
@@ -306,8 +313,12 @@
   инвариантов (статус `non_comparable` + структурированные причины в
   `status_reasons`, вид `kind=invariant|exception`). Сопоставимость **ступени**
   раннер отражает флагом `step_comparable` (= `completion_is_fixed` AND
-  `finish_reason = length` AND `prompt_prefix_ok`), а не статусом прогона.
-  Каноничность строится агрегатором **per-ступень** по `step_comparable`.
+  `finish_reason = length` AND `prompt_prefix_ok`; в cold-режиме дополнительно
+  `cache_hit_fraction ≤ cold_cache_hit_tolerance`), а не статусом прогона;
+  причина несопоставимости записывается полем `step_comparable_reason`
+  (`not_fixed`, `finish_reason`, `prefix_mismatch`, `cold_cache_hit_exceeded`,
+  `cold_cache_hit_unknown`). Каноничность строится агрегатором **per-ступень**
+  по `step_comparable`.
 - **Ступень, а не прогон.** Один прогон ladder может содержать и comparable-, и
   non-comparable-ступени. Поэтому статус прогона по генерации делится на
   `fixed` (все ступени comparable), `mixed` (часть) и `variable` (ни одной);
@@ -356,7 +367,7 @@
 | --- | --- | --- | --- |
 | prefill tok/s | prompt eval tokens / prompt eval time | `prompt eval time = … (… tokens per second)` в `server.log`; `timings.prompt_per_second` | измерено |
 | decode tok/s | eval tokens / eval time | `eval time = … (… tokens per second)`; `timings.predicted_per_second` | измерено |
-| TTFT | время до первого токена | стриминговый клиент | измерено |
+| TTFT | время до первого токена; измеряется отдельным стриминговым клиентом (**optional extension**); основной ladder-раннер шлёт `stream=false` и TTFT не измеряет | стриминговый клиент (не ladder-раннер) | измерено (опционально) |
 | elapsed | полное время запроса | клиент, end-to-end | измерено |
 | `cache_hit_fraction` | доля промпта из кеша | `1 − evaluated/prompt`; `cache_n/(cache_n+prompt_n)` | вычислено |
 | пик VRAM | максимум `memory.used` по карте | `telemetry.csv` | измерено |
@@ -364,7 +375,7 @@
 | acceptance | `draft_n_accepted / draft_n`; средняя длина драфта | `timings` / `draft acceptance` в логе | измерено |
 | средняя мощность (`power_avg_w`) | суммарная по `<GPU>` мощность, проинтегрированная по окну запроса, / длительность окна | `telemetry.csv` (`gpuN_power_w`); агрегатор | вычислено (оценка) |
 | энергия запроса (`energy_j`) | интеграл суммарной мощности по окну запроса (трапеции) | `telemetry.csv`; агрегатор | вычислено (оценка) |
-| динамическая энергия (`energy_dynamic_j`) | интеграл `max(0, P − base)`; `base` — минимум суммарной мощности за прогон | `telemetry.csv`; агрегатор | вычислено (оценка) |
+| динамическая энергия (`energy_dynamic_j`) | интеграл `max(0, P − base)`; `base` — медиана суммарной мощности в idle-окне перед первым запросом (`[min(started_at_utc) − 10 с, min(started_at_utc)]`); при недостатке сэмплов fallback — минимум по прогону; источник в `idle_baseline_source` | `telemetry.csv`; агрегатор | вычислено (оценка) |
 | J/output-token (`energy_per_output_token_j`) | `energy_j / completion_tokens` | агрегатор | вычислено (оценка) |
 | J/input-token (`energy_per_input_token_j`) | `energy_j / evaluated_tokens` | агрегатор | вычислено (оценка) |
 
@@ -373,6 +384,12 @@
   `started_at_utc`/`finished_at_utc` и аппроксимируется краевой интерполяцией
   мощности. Энергетические метрики вычисляет агрегатор при наличии
   `telemetry.csv` и меток времени (разделы 10, 11.1); иначе поля пусты.
+- **Baseline для `energy_dynamic_j`.** `base` — медиана суммарной мощности в
+  явном idle-окне `[min(started_at_utc) − 10 с, min(started_at_utc)]`
+  (`IDLE_WINDOW_S = 10`), а не минимум по прогону; при < 2 сэмплов в окне
+  агрегатор откатывается на минимум по прогону. Выбранный baseline и его
+  источник фиксируются в полях `idle_baseline_w`/`idle_baseline_source`/
+  `idle_window_s`. `energy_j` считается без baseline (полная энергия окна).
 - **Канонический источник каждой метрики** задан в столбце «Источник». При
   наличии и API-полей `timings.*`, и строк лога сохранять **оба** значения и
   проверять расхождение между ними.
@@ -471,7 +488,10 @@ AND `step_comparable != false`). Поле `step_comparable` опциональн
 `prompt_prefix_ok`), поэтому для **новых** прогонов действуют все три условия.
 Агрегатор (`scripts/report/generate_report.py`, `step_is_comparable`)
 `prompt_prefix_ok` напрямую **не проверяет** и для **legacy**-прогонов без поля
-`step_comparable` опирается на первые два условия.
+`step_comparable` опирается на первые два условия. Для cold-прогонов
+(`cache_prompt = false`) раннер дополнительно кодирует инвариант cache-hit в
+`step_comparable` (разделы 4.4, 7.1), поэтому условие `step_comparable != false`
+уже включает его.
 
 1. Исключить прогоны со статусами `failed`, `timeout`, `non_comparable`, а
    внутри `ok`-прогонов — ступени, не прошедшие `step_comparable`.
@@ -743,3 +763,15 @@ per-ступень (comparable-ступени, limited-ступени вне о�
 `step_comparable` опирается на первые два условия. §7.1 согласован: там
 `prompt_prefix_ok` уже описан как часть определения `step_comparable` раннера, а
 не как прямое условие агрегатора.
+
+2026-09-24 — синхронизация с тремя новыми фактами кода: в §4.4 (и ссылке в §3)
+cold-инвариант описан как автоматическая проверка раннера
+(`step_comparable_reason`) с порогом `cold_cache_hit_tolerance` из профиля
+(дефолт 0.005), причинами `cold_cache_hit_exceeded`/`cold_cache_hit_unknown`
+(fail-closed при неизвестном cache-hit) и полем `step_comparable_reason`; в §7.1
+перечислены новые причины и поле, §11.1 согласован; в §8 TTFT переформулирован
+как **optional extension** (основной ladder-раннер шлёт `stream=false` и TTFT не
+измеряет), а формула `energy_dynamic_j` приведена к медиане суммарной мощности в
+idle-окне перед первым запросом (`IDLE_WINDOW_S = 10`; fallback — минимум по
+прогону, источник в `idle_baseline_source`), с отдельным пояснением baseline и
+сохранением `energy_j` без изменений.

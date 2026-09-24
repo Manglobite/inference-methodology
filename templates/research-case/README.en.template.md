@@ -38,8 +38,10 @@ reproduced (see [RUNBOOK.md](RUNBOOK.md), [LICENSE-NOTICE.md](LICENSE-NOTICE.md)
 ## Methodology
 
 FILL IN: run modes (smoke/ladder/A-B), fixed generation (seed,
-`temperature: 0`, `ignore_eos`, `n_predict`), device binding, telemetry
-collection. The general methodology is in
+`temperature: 0`, `ignore_eos`, `n_predict`), device binding, prompt-cache mode
+(`cache_prompt`; when `false` — the cold mode with automatic checking of the
+`cold_cache_hit_tolerance` threshold and the `step_comparable_reason`),
+telemetry collection. The general methodology is in
 [METHODOLOGY.md](../../METHODOLOGY.md).
 
 > The link `../../METHODOLOGY.md` is correct **for the skeleton**
@@ -78,8 +80,10 @@ the matching steps, median delta, `n_pairs`, `sign_consistency`) from the report
 and `docs/results.json` (`ab_delta`, key `"profile|order"`). When power telemetry
 exists, give the step energy estimate (J/request = `energy_j`, J/output-token
 from `telemetry.csv`; the report's "Energy and power" section), marked as an
-**estimate**; without power telemetry this is not a blocker — record an explicit
-"no data".
+**estimate**; `energy_dynamic_j` subtracts an idle-window baseline (median total
+power over `IDLE_WINDOW_S` before the first request, falling back to the run
+minimum; source in `idle_baseline_source`); without power telemetry this is not a
+blocker — record an explicit "no data".
 
 ## Figures
 

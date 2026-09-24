@@ -169,6 +169,14 @@ matter for comparability and reproduction also belong to `command` and the
 profile: `--fit off`, `--kv-offload`, `--flash-attn on`, `--cache-prompt`,
 `--cache-ram`, `--kv-unified`, `--timeout`, `--metrics`, `--reasoning off`.
 
+The prompt-cache mode is set by the profile key `cache_prompt` (`false` is the
+cold mode). In cold mode the runner automatically checks the "cache hit ≈ 0"
+invariant: if `cache_hit_fraction` exceeds the `cold_cache_hit_tolerance`
+threshold (profile value, default `0.005`) or the cache hit is unknown, the step
+is not comparable and the reason is recorded in `step_comparable_reason`
+(`cold_cache_hit_exceeded` / `cold_cache_hit_unknown`); the threshold itself is
+stored in `result.json` (`cold_cache_hit_tolerance`).
+
 > **The full actual `command` is the source of truth.** The summary fields
 > (`ctx_size`, `cache_type_*`, `seed`, `n_predict`, mode flags) must match the
 > command; if they disagree, the command wins and the fields must be fixed.
@@ -250,8 +258,11 @@ power (`gpuN_power_w`), the aggregator computes the step energy: `energy_j` is
 the trapezoid integral of power over the actual `dt` inside the
 `started_at_utc`/`finished_at_utc` window; `power_avg_w` is the average power;
 `energy_per_output_token_j` / `energy_per_input_token_j` are joules per
-output/input token (J/request is `energy_j`); `energy_dynamic_j` subtracts the
-idle minimum of the total power. This is an **estimate** from telemetry, not a
+output/input token (J/request is `energy_j`); `energy_dynamic_j` subtracts an
+idle-window baseline — the median total power over `IDLE_WINDOW_S` = 10 s before
+the first request (fallback — the run minimum; source in `idle_baseline_source`,
+fields `idle_baseline_w` / `idle_window_s`). This is an **estimate** from
+telemetry, not a
 direct meter reading. Step labels `started_at_utc`/`finished_at_utc` are
 required: without them or without telemetry there is no energy — this is **not a
 blocker**, and the report prints an explicit "no data" line. The report section

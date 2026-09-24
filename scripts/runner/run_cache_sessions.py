@@ -157,12 +157,47 @@ def mark_non_comparable(report, reasons):
         report["status"] = STATUS_NON_COMPARABLE
 
 
-def step_comparable(entry, prefix_ok):
+def step_comparable_reason(entry, prefix_ok, cache_prompt=True, cold_tolerance=0.005):
+    """Return the reason a step is non-comparable, or None when it is.
+
+    Base conditions (unchanged): decoding must be full-length
+    (`completion_is_fixed is True`), the server must report `finish_reason ==
+    "length"` and the prompt must extend the previous one (`prefix_ok is True`).
+    Reasons are checked in that order and reported as `not_fixed`,
+    `finish_reason` or `prefix_mismatch`.
+
+    When `cache_prompt is False` the cold-mode invariant applies (METHODOLOGY
+    sections 3/4.4): prompt reuse must be ~0, so the effective cache-hit
+    fraction must not exceed `cold_tolerance`. The hit fraction is
+    `cache_hit_fraction`, falling back to `cache_hit_fraction_api` when the
+    former is absent; exceeding the tolerance yields `cold_cache_hit_exceeded`.
+    A missing hit fraction under cold mode yields `cold_cache_hit_unknown`:
+    without a measured hit the invariant cannot be confirmed, so the step is
+    deliberately *not* comparable (fail closed) rather than assumed clean.
+    With `cache_prompt=True` (the default) the invariant is not applied and the
+    cold checks are skipped, preserving the previous behaviour.
+    """
+    if entry.get("completion_is_fixed") is not True:
+        return "not_fixed"
+    if entry.get("finish_reason") != "length":
+        return "finish_reason"
+    if prefix_ok is not True:
+        return "prefix_mismatch"
+    if cache_prompt is False:
+        cache_hit = entry.get("cache_hit_fraction")
+        if cache_hit is None:
+            cache_hit = entry.get("cache_hit_fraction_api")
+        if cache_hit is None:
+            return "cold_cache_hit_unknown"
+        if cache_hit > cold_tolerance:
+            return "cold_cache_hit_exceeded"
+    return None
+
+
+def step_comparable(entry, prefix_ok, cache_prompt=True, cold_tolerance=0.005):
     """A step is comparable only when decoding was full-length and in order."""
     return (
-        entry.get("completion_is_fixed") is True
-        and entry.get("finish_reason") == "length"
-        and prefix_ok is True
+        step_comparable_reason(entry, prefix_ok, cache_prompt, cold_tolerance) is None
     )
 
 
@@ -914,7 +949,7 @@ def build_targets(ctx_size, ladder_pcts=None):
     ]
 
 
-def run_ladder(base_url, profile, targets, seed, log_path, records, cache_prompt=True):
+def run_ladder(base_url, profile, targets, seed, log_path, records, cache_prompt=True, cold_tolerance=0.005):
     model = profile["served_model_name"]
     max_tokens = int(profile.get("n_predict", 128))
     prompt = "Привет"
@@ -932,7 +967,11 @@ def run_ladder(base_url, profile, targets, seed, log_path, records, cache_prompt
             "raw_prompt_tokens": prompt_tokens,
             "prompt_prefix_ok": prefix_ok,
         })
-        entry["step_comparable"] = step_comparable(entry, prefix_ok)
+        entry["cold_cache_hit_tolerance"] = cold_tolerance
+        entry["step_comparable_reason"] = step_comparable_reason(
+            entry, prefix_ok, cache_prompt, cold_tolerance
+        )
+        entry["step_comparable"] = step_comparable(entry, prefix_ok, cache_prompt, cold_tolerance)
         previous_prompt = prompt
         records.append(entry)
         print(
@@ -946,7 +985,7 @@ def run_ladder(base_url, profile, targets, seed, log_path, records, cache_prompt
     return records
 
 
-def run_ab_sequence(base_url, profile, targets, order, seed, log_path, records, cache_prompt=True):
+def run_ab_sequence(base_url, profile, targets, order, seed, log_path, records, cache_prompt=True, cold_tolerance=0.005):
     """Interleave two sessions, one ladder rung per visit, following `order`.
 
     `order` is a repeating pattern (e.g. `ABAB`, `ABBABAA`); it is cycled
@@ -987,7 +1026,11 @@ def run_ab_sequence(base_url, profile, targets, order, seed, log_path, records, 
             "raw_prompt_tokens": prompt_tokens[session],
             "prompt_prefix_ok": prefix_ok,
         })
-        entry["step_comparable"] = step_comparable(entry, prefix_ok)
+        entry["cold_cache_hit_tolerance"] = cold_tolerance
+        entry["step_comparable_reason"] = step_comparable_reason(
+            entry, prefix_ok, cache_prompt, cold_tolerance
+        )
+        entry["step_comparable"] = step_comparable(entry, prefix_ok, cache_prompt, cold_tolerance)
         previous_prompts[session] = prompts[session]
         records.append(entry)
         print(
@@ -1104,6 +1147,7 @@ def main():
         ladder_pcts = [int(pct) for pct in ladder_pcts]
     targets = build_targets(ctx_size, ladder_pcts)
     cache_prompt = bool(profile.get("cache_prompt", True))
+    cold_cache_hit_tolerance = float(profile.get("cold_cache_hit_tolerance", 0.005))
     telemetry_stop = threading.Event()
     telemetry = None
     process = None
@@ -1131,6 +1175,7 @@ def main():
         "cache_type_k": profile.get("cache_type_k"),
         "cache_type_v": profile.get("cache_type_v"),
         "cache_prompt": cache_prompt,
+        "cold_cache_hit_tolerance": cold_cache_hit_tolerance,
         "n_predict": int(profile.get("n_predict", 128)),
         "seed": args.seed,
         "port": port,
@@ -1172,13 +1217,13 @@ def main():
                     if args.mode == "ladder":
                         run_ladder(
                             base_url, profile, targets, args.seed, result_dir / "server.log",
-                            report["steps"], cache_prompt,
+                            report["steps"], cache_prompt, cold_cache_hit_tolerance,
                         )
                     else:
                         report["order"] = args.order
                         run_ab_sequence(
                             base_url, profile, targets, args.order, args.seed, result_dir / "server.log",
-                            report["steps"], cache_prompt,
+                            report["steps"], cache_prompt, cold_cache_hit_tolerance,
                         )
                     log_path = result_dir / "server.log"
                     log_text = (

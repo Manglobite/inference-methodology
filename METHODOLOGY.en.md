@@ -134,7 +134,7 @@ on another stand.
 | Context size | `<CTX>` | weights, KV quantization, layout |
 | Runtime/build variant | `<RUNTIME>` (baseline vs patch) | model, KV, `<CTX>`, layout |
 | Device order | `--device` (order of cards) | everything else; verify byte-identical output |
-| Prompt cache | `cache_prompt` (`true`/`false`) | weights, KV, `<CTX>`, layout; with `false` — the `cache_hit ≈ 0` invariant |
+| Prompt cache | `cache_prompt` (`true`/`false`) | weights, KV, `<CTX>`, layout; with `false` — the `cache_hit ≈ 0` invariant (checked by the runner, section 4.4) |
 
 **One-change rule.** One comparison — exactly one difference. If a sweep changes
 several parameters at once, it is a **confound**: its contribution is not
@@ -185,8 +185,16 @@ non-monotonicity** if it is observed.
   fill). Do not compare prefill/decode values across different rungs.
 - **Optional cold mode.** The profile may set `cache_prompt = false` (a
   configurable axis, section 3). Then a hard invariant applies: `cache_hit ≈ 0`
-  at every rung; when it does not hold, the rung is marked `non_comparable`. Do
-  not expand cold mode into a full protocol — only as a separate comparison axis.
+  at every rung. The invariant is checked automatically by the runner
+  (`step_comparable_reason` in `scripts/runner/run_cache_sessions.py`): with
+  `cache_prompt = false` a rung is **not comparable** when
+  `cache_hit_fraction > cold_cache_hit_tolerance` (reason
+  `cold_cache_hit_exceeded`), and also when the cache-hit is unknown (reason
+  `cold_cache_hit_unknown`, fail-closed: without a measurement the invariant is
+  not confirmed). The tolerance comes from the profile
+  (`cold_cache_hit_tolerance`, default `0.005`) and is recorded in `result.json`;
+  the rung carries `step_comparable_reason`. Do not expand cold mode into a full
+  protocol — only as a separate comparison axis.
 
 ### 4.5. Adapting to your `<CTX>`
 
@@ -312,8 +320,12 @@ Every run has exactly one status:
   `status_reasons`, of kind `kind=invariant|exception`). **Step** comparability
   is expressed by the runner as the `step_comparable` flag
   (= `completion_is_fixed` AND `finish_reason = length` AND
-  `prompt_prefix_ok`), not by the run status. Canonicality is built by the
-  aggregator **per step** from `step_comparable`.
+  `prompt_prefix_ok`; in cold mode additionally
+  `cache_hit_fraction ≤ cold_cache_hit_tolerance`), not by the run status; the
+  reason for non-comparability is recorded in the `step_comparable_reason` field
+  (`not_fixed`, `finish_reason`, `prefix_mismatch`, `cold_cache_hit_exceeded`,
+  `cold_cache_hit_unknown`). Canonicality is built by the aggregator **per step**
+  from `step_comparable`.
 - **Step, not run.** A single ladder run may contain both comparable and
   non-comparable steps. Therefore a run's generation status is `fixed` (all steps
   comparable), `mixed` (some) or `variable` (none); the aggregator builds the
@@ -361,7 +373,7 @@ your `<CTX>`; TIMEOUT ≠ failure — it is a separate status.
 | --- | --- | --- | --- |
 | prefill tok/s | prompt eval tokens / prompt eval time | `prompt eval time = … (… tokens per second)` in `server.log`; `timings.prompt_per_second` | measured |
 | decode tok/s | eval tokens / eval time | `eval time = … (… tokens per second)`; `timings.predicted_per_second` | measured |
-| TTFT | time to first token | streaming client | measured |
+| TTFT | time to first token; measured by a separate streaming client (**optional extension**); the main ladder runner sends `stream=false` and does not measure TTFT | streaming client (not the ladder runner) | measured (optional) |
 | elapsed | total request time | client, end-to-end | measured |
 | `cache_hit_fraction` | fraction of the prompt from cache | `1 − evaluated/prompt`; `cache_n/(cache_n+prompt_n)` | computed |
 | peak VRAM | maximum `memory.used` per card | `telemetry.csv` | measured |
@@ -369,7 +381,7 @@ your `<CTX>`; TIMEOUT ≠ failure — it is a separate status.
 | acceptance | `draft_n_accepted / draft_n`; mean draft length | `timings` / `draft acceptance` in the log | measured |
 | average power (`power_avg_w`) | total `<GPU>` power integrated over the request window / window duration | `telemetry.csv` (`gpuN_power_w`); aggregator | computed (estimate) |
 | request energy (`energy_j`) | integral of total power over the request window (trapezoids) | `telemetry.csv`; aggregator | computed (estimate) |
-| dynamic energy (`energy_dynamic_j`) | integral of `max(0, P − base)`; `base` = the minimum total power over the run | `telemetry.csv`; aggregator | computed (estimate) |
+| dynamic energy (`energy_dynamic_j`) | integral of `max(0, P − base)`; `base` = the median total power in the idle window before the first request (`[min(started_at_utc) − 10 s, min(started_at_utc)]`); with too few samples the fallback is the run-wide minimum; source in `idle_baseline_source` | `telemetry.csv`; aggregator | computed (estimate) |
 | J/output-token (`energy_per_output_token_j`) | `energy_j / completion_tokens` | aggregator | computed (estimate) |
 | J/input-token (`energy_per_input_token_j`) | `energy_j / evaluated_tokens` | aggregator | computed (estimate) |
 
@@ -378,6 +390,13 @@ your `<CTX>`; TIMEOUT ≠ failure — it is a separate status.
   `started_at_utc`/`finished_at_utc` pair and approximated by edge interpolation
   of power. The aggregator computes the energy metrics when `telemetry.csv` and
   the timestamps are present (sections 10, 11.1); otherwise the fields are empty.
+- **Baseline for `energy_dynamic_j`.** `base` is the median total power in the
+  explicit idle window `[min(started_at_utc) − 10 s, min(started_at_utc)]`
+  (`IDLE_WINDOW_S = 10`), not the run-wide minimum; with < 2 samples in the
+  window the aggregator falls back to the run-wide minimum. The chosen baseline
+  and its source are recorded in the `idle_baseline_w`/`idle_baseline_source`/
+  `idle_window_s` fields. `energy_j` is computed without a baseline (the full
+  window energy).
 - **The canonical source of every metric** is given in the "Source" column. When
   both API fields `timings.*` and log lines are present, preserve **both** values
   and check the divergence between them.
@@ -478,7 +497,10 @@ forms it as (`completion_is_fixed` AND `finish_reason = length` AND
 `prompt_prefix_ok`), so for **new** runs all three conditions apply. The
 aggregator (`scripts/report/generate_report.py`, `step_is_comparable`) does
 **not** check `prompt_prefix_ok` directly and, for **legacy** runs without the
-`step_comparable` field, relies on the first two conditions.
+`step_comparable` field, relies on the first two conditions. For cold runs
+(`cache_prompt = false`) the runner additionally encodes the cache-hit invariant
+in `step_comparable` (sections 4.4, 7.1), so the `step_comparable != false`
+condition already includes it.
 
 1. Exclude runs with the `failed`, `timeout`, `non_comparable` statuses, and
    within `ok` runs — steps that fail `step_comparable`.
@@ -755,3 +777,16 @@ code: in §11.1 the comparable condition was brought to the actual one
 the `step_comparable` field, relies on the first two conditions. §7.1 is
 consistent: there `prompt_prefix_ok` is already described as part of the
 runner's `step_comparable` definition, not as a direct aggregator condition.
+
+2026-09-24 — synchronization with three new code facts: in §4.4 (and the
+reference in §3) the cold invariant is described as an automatic runner check
+(`step_comparable_reason`) with the profile tolerance `cold_cache_hit_tolerance`
+(default 0.005), the reasons `cold_cache_hit_exceeded`/`cold_cache_hit_unknown`
+(fail-closed when the cache-hit is unknown) and the `step_comparable_reason`
+field; in §7.1 the new reasons and the field are listed, and §11.1 is made
+consistent; in §8 TTFT is reformulated as an **optional extension** (the main
+ladder runner sends `stream=false` and does not measure TTFT), and the
+`energy_dynamic_j` formula is brought to the median total power in the idle
+window before the first request (`IDLE_WINDOW_S = 10`; fallback — the run-wide
+minimum, source in `idle_baseline_source`), with a separate baseline note and
+`energy_j` left unchanged.

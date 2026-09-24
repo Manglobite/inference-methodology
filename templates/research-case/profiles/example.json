@@ -1,5 +1,5 @@
 {
-  "_note": "Syntactically valid JSON TEMPLATE, not ready to run: replace every <...> placeholder and delete this _note. The example shows a two-GPU topology -- verify it against your own rig. Key fields: name (must match the file name without .json); engine; model_path (relative to the repo root); served_model_name (API alias); binary (path to the server binary); build_variant (manifest key); gpu {pci_bus_id, cuda_visible_devices, llama_device}; ctx_size; parallel; cache_type_k/cache_type_v; generation fields seed/temperature/ignore_eos/n_predict (fixed for comparability); port; command_env; command (the actual argv, <repo> is the repo-root placeholder) and the mode flags below. The full actual command is the source of truth: everything else here is a human-readable summary of it.",
+  "_note": "Syntactically valid JSON TEMPLATE, not ready to run: replace every <...> placeholder and delete this _note. The example shows a two-GPU topology -- verify it against your own rig. Key fields: name (must match the file name without .json); engine; model_path (relative to the repo root); served_model_name (API alias); binary (path to the server binary); build_variant (manifest key); gpu {pci_bus_id, cuda_visible_devices, llama_device}; ctx_size; parallel; cache_type_k/cache_type_v; generation fields seed/temperature/ignore_eos/n_predict (fixed for comparability); port; command_env; command (the actual argv, <repo> is the repo-root placeholder) and the mode flags below. The full actual command is the source of truth: everything else here is a human-readable summary of it. Optional cold-mode keys (needed only for the cold mode, cache_prompt=false): cache_prompt (default true; set false to disable prompt reuse) and cold_cache_hit_tolerance (default 0.005; a cold step is non-comparable when the cache-hit fraction exceeds this threshold or is unknown, with the reason recorded in step_comparable_reason).",
   "name": "<profile>",
   "engine": "llama.cpp",
   "model_path": "data/models/<MODEL>-<quant>.gguf",
@@ -18,6 +18,8 @@
   "parallel": 1,
   "cache_type_k": "q8_0",
   "cache_type_v": "q8_0",
+  "cache_prompt": true,
+  "cold_cache_hit_tolerance": 0.005,
   "seed": 42,
   "temperature": 0,
   "ignore_eos": true,

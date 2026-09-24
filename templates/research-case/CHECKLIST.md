@@ -88,8 +88,10 @@
 - [ ] **Энергетика** (условно, при наличии телеметрии мощности): per-step
       `energy_j`/`power_avg_w`/`energy_per_output_token_j` (J/request и
       J/output-token из `telemetry.csv`, помечено как **оценка**), агрегированы
-      медианой + min/max; если телеметрии мощности нет — в отчёте явное
-      «нет данных», это не блокер.
+      медианой + min/max; baseline `energy_dynamic_j` — из idle-окна (медиана
+      суммарной мощности за `IDLE_WINDOW_S` перед первым запросом, fallback —
+      минимум по прогону; проверить `idle_baseline_source`/`idle_baseline_w`);
+      если телеметрии мощности нет — в отчёте явное «нет данных», это не блокер.
 - [ ] **Парный A/B-Δ** (при наличии A/B-серии): присутствует Δ = 100·(B−A)/A по
       совпадающим ступеням с медианой Δ, `n_pairs` и `sign_consistency`; отражён
       в отчёте и в `docs/results.json` (`ab_delta`, ключ `"profile|order"`).
@@ -100,7 +102,14 @@
       (**медиана + min/max**, указаны `n` и список `run_id`).
 - [ ] **Ступень-фильтр** применён: ступени с `finish_reason != length` или
       `completion_is_fixed != true` (`step_comparable = false`) в агрегат не
-      входят и перечислены с причиной (не отброшены молча).
+      входят и перечислены с причиной (`step_comparable_reason`) — не отброшены
+      молча.
+- [ ] **Cold-инвариант** (профиль `cache_prompt = false`): раннер автоматически
+      проверил `cache_hit_fraction` против порога `cold_cache_hit_tolerance`
+      (порог из профиля, дефолт `0.005`); при превышении порога или неизвестном
+      cache-hit ступень помечена не comparable, причина — в
+      `step_comparable_reason` (`cold_cache_hit_exceeded`/
+      `cold_cache_hit_unknown`), порог сохранён в `result.json`.
 - [ ] **Limited вне основной выдачи**: ступени с `n < 3` помечены `limited` и
       выведены отдельным разделом; их нет в основных таблицах и графиках.
 - [ ] **Статус прогона по генерации** — `fixed` (все ступени comparable),
@@ -112,8 +121,9 @@
 - [ ] **Санитайз путей в `results.json`**: в `docs/results.json` нет абсолютных
       путей — агрегатор скрабит их до `<path>/<basename>`.
 - [ ] **Поля ступени**: в `result.json` есть `step_comparable`,
-      `timing_delta_pct` (prefill/decode) и `overhead_s`; расхождение
-      API-vs-лог отражено в отчёте (пороги: ≥ 0.1 % значимо).
+      `step_comparable_reason`, `timing_delta_pct` (prefill/decode) и
+      `overhead_s`; расхождение API-vs-лог отражено в отчёте (пороги: ≥ 0.1 %
+      значимо).
 - [ ] Производные величины помечены как **вычислено**; интерпретация отделена
       от фактов.
 - [ ] **Ограничения** и «что не исследовано» описаны.

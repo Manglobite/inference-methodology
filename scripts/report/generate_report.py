@@ -78,6 +78,10 @@ ENERGY_SAMPLE_METRIC_KEYS = ("energy_samples",)
 # aggregated as a scalar; the GPU breakdown stays only in the raw runs.
 METRIC_KEYS = BASE_METRIC_KEYS + ENERGY_METRIC_KEYS + ENERGY_SAMPLE_METRIC_KEYS
 TELEMETRY_FILENAME = "telemetry.csv"
+# Width of the explicit idle window probed right before the first request
+# (model already loaded, GPU idle). The total watts are reduced by their median
+# over this window, which is robust to a single low sample.
+IDLE_WINDOW_S = 10.0
 _GPU_POWER_RE = re.compile(r"^gpu(\d+)_power_w$")
 _TS_FORMATS = ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ")
 
@@ -421,17 +425,44 @@ def integrate_gpu_energy(points, t0, t1):
     return result
 
 
-def idle_baseline_w(points):
-    """Idle (baseline) total power as the minimum total watts over the run.
+def idle_baseline_w(points, window_end=None, window_s=IDLE_WINDOW_S):
+    """Idle (baseline) total power estimate.
 
-    The minimum is the robust choice for this fixed-cadence telemetry: load
-    phases are a minority of samples, so the lowest sample is the idle floor
-    and cannot be pulled up by load spikes (unlike the mean or the median).
-    Returns None when there are no samples.
+    With an explicit idle window ending at `window_end` (the first request's
+    `started_at_utc`, i.e. the model is loaded and the GPU is idle), the
+    baseline is the **median** of the total watts over
+    `[window_end - window_s, window_end]`. The median is robust to a single
+    downward outlier, unlike the run-wide minimum, which one low sample shifts.
+    When fewer than two samples fall inside that window, or when `window_end`
+    is None, the previous behaviour is kept as a fallback: the minimum total
+    watts over the whole run.
+
+    Returns `{"baseline_w": float|None, "source": "idle_window_median"|
+    "run_minimum_fallback", "samples": int, "window_s": float}`; `baseline_w`
+    is None when there are no samples.
     """
-    if not points:
-        return None
-    return min(point[1] for point in points)
+    source = "run_minimum_fallback"
+    samples = 0
+    baseline_w = None
+    if window_end is not None and points:
+        window_start = window_end - dt.timedelta(seconds=window_s)
+        window_watts = [
+            point[1] for point in points
+            if window_start <= point[0] <= window_end
+        ]
+        if len(window_watts) >= 2:
+            baseline_w = statistics.median(window_watts)
+            source = "idle_window_median"
+            samples = len(window_watts)
+    if baseline_w is None and points:
+        baseline_w = min(point[1] for point in points)
+        samples = len(points)
+    return {
+        "baseline_w": baseline_w,
+        "source": source,
+        "samples": samples,
+        "window_s": window_s,
+    }
 
 
 def _per_token(energy_j, tokens):
@@ -485,14 +516,52 @@ def step_energy_fields(step, points, baseline_w):
     return fields
 
 
+_ENERGY_SCALAR_FIELDS = (
+    "energy_j",
+    "power_avg_w",
+    "energy_dynamic_j",
+    "energy_per_output_token_j",
+    "energy_per_input_token_j",
+    "energy_per_output_token_j_dynamic",
+)
+
+
+def _fresh_energy_value(key, value):
+    """Whether a freshly computed energy field should replace a stored one.
+
+    A scalar `None` means "no telemetry/timestamps", so the stored value is
+    kept. `energy_samples` is an int (0 when absent) and `gpu_energy_j` a
+    mapping, so emptiness is the signal there instead.
+    """
+    if key == "energy_samples":
+        return is_number(value) and value > 0
+    if key == "gpu_energy_j":
+        return isinstance(value, dict) and len(value) > 0
+    return value is not None
+
+
 def enrich_step_energy(steps, run_dir):
     """Return copies of `steps` enriched with energy fields.
 
-    Existing keys are never overwritten (setdefault); non-dict entries pass
-    through unchanged. Telemetry is read once per run.
+    Derived energy fields (`step_energy_fields`) and the idle-baseline metadata
+    are owned by this aggregator: they are recomputed on every report
+    regeneration, so a stale value already stored in result.json (computed
+    against an older baseline) is refreshed. A stored value is kept only when
+    the fresh computation has no data (None / zero samples / empty mapping),
+    which preserves fields when telemetry or timestamps are missing. Fields
+    written by the runner are never overwritten. Non-dict entries pass through
+    unchanged. Telemetry is read once per run.
     """
     points = load_telemetry(run_dir / TELEMETRY_FILENAME)
-    baseline_w = idle_baseline_w(points)
+    start_times = [
+        parse_utc(step.get("started_at_utc"))
+        for step in steps
+        if isinstance(step, dict)
+    ]
+    start_times = [value for value in start_times if value is not None]
+    window_end = min(start_times) if start_times else None
+    baseline = idle_baseline_w(points, window_end=window_end)
+    baseline_w = baseline["baseline_w"]
     enriched = []
     for step in steps:
         if not isinstance(step, dict):
@@ -500,7 +569,14 @@ def enrich_step_energy(steps, run_dir):
             continue
         item = dict(step)
         for key, value in step_energy_fields(item, points, baseline_w).items():
-            item.setdefault(key, value)
+            if key in _ENERGY_SCALAR_FIELDS or key in ("energy_samples", "gpu_energy_j"):
+                if _fresh_energy_value(key, value):
+                    item[key] = value
+            else:
+                item.setdefault(key, value)
+        item["idle_baseline_w"] = baseline["baseline_w"]
+        item["idle_baseline_source"] = baseline["source"]
+        item["idle_window_s"] = baseline["window_s"]
         enriched.append(item)
     return enriched
 
@@ -1434,11 +1510,15 @@ def render_markdown(runs, cfg, aggregation, config_note):
         "Полная энергия и средняя мощность ступени по `telemetry.csv`: интеграл "
         "`gpuN_power_w` трапециями по фактическим `dt` в окне "
         "`started_at_utc`/`finished_at_utc`. `energy_dynamic_j` вычитает "
-        "idle-минимум суммарной мощности; per-token энергии делят энергию на "
+        "baseline из idle-окна (медиана суммарной мощности за `IDLE_WINDOW_S` "
+        "перед первым запросом, fallback — минимум по прогону; источник — "
+        "`idle_baseline_source`); per-token энергии делят энергию на "
         "`completion_tokens`/`evaluated_tokens`. Медиана + min/max, как в "
         "лесенке. / Per-step energy and average power from `telemetry.csv` "
-        "(trapezoid integral over the step window); dynamic energy subtracts the "
-        "idle minimum; per-token energies divide by the token counts.",
+        "(trapezoid integral over the step window); dynamic energy subtracts an "
+        "idle-window baseline (median total power over `IDLE_WINDOW_S` before the "
+        "first request, falling back to the run minimum; source in "
+        "`idle_baseline_source`); per-token energies divide by the token counts.",
         "",
     ]
     lines += render_energy(aggregation, cfg, profile_names(cfg))

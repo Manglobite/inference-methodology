@@ -38,7 +38,9 @@ sha256 (см. [RUNBOOK.md](RUNBOOK.md), [LICENSE-NOTICE.md](LICENSE-NOTICE.md)).
 ## Методика
 
 ЗАПОЛНИТЬ: режимы прогонов (smoke/ladder/A-B), фиксация генерации (seed,
-`temperature: 0`, `ignore_eos`, `n_predict`), привязка устройств, сбор
+`temperature: 0`, `ignore_eos`, `n_predict`), привязка устройств, режим
+prompt-кеша (`cache_prompt`; при `false` — cold-режим с автоматической проверкой
+порога `cold_cache_hit_tolerance` и причины `step_comparable_reason`), сбор
 телеметрии. Общая методика — в
 [METHODOLOGY.md](../../METHODOLOGY.md).
 
@@ -77,7 +79,10 @@ min/max**, с указанием `n` и списка `run_id`); ступени �
 `docs/results.json` (`ab_delta`, ключ `"profile|order"`). При наличии телеметрии
 мощности — оценка энергетики ступени (J/request = `energy_j`, J/output-token из
 `telemetry.csv`; секция «Энергия и мощность» отчёта), помеченная как **оценка**;
-если телеметрии мощности нет — это не блокер, зафиксируйте явное «нет данных».
+`energy_dynamic_j` вычитает baseline из idle-окна (медиана суммарной мощности за
+`IDLE_WINDOW_S` перед первым запросом, fallback — минимум по прогону; источник —
+`idle_baseline_source`); если телеметрии мощности нет — это не блокер,
+зафиксируйте явное «нет данных».
 
 ## Графики
 

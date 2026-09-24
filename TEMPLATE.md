@@ -167,6 +167,14 @@
 `--fit off`, `--kv-offload`, `--flash-attn on`, `--cache-prompt`,
 `--cache-ram`, `--kv-unified`, `--timeout`, `--metrics`, `--reasoning off`.
 
+Режим prompt-кеша задаётся ключом профиля `cache_prompt` (при `false` —
+cold-режим). В cold-режиме раннер автоматически проверяет инвариант
+«cache-hit ≈ 0»: если `cache_hit_fraction` превышает порог
+`cold_cache_hit_tolerance` (порог из профиля, дефолт `0.005`) или cache-hit
+неизвестен, ступень не comparable, а причина записана в `step_comparable_reason`
+(`cold_cache_hit_exceeded` / `cold_cache_hit_unknown`); сам порог сохраняется в
+`result.json` (`cold_cache_hit_tolerance`).
+
 > **Полный фактический `command` — источник истины.** Поля-сводки (`ctx_size`,
 > `cache_type_*`, `seed`, `n_predict`, режимные флаги) должны совпадать с
 > командой; при расхождении верна команда, а поля нужно поправить.
@@ -248,7 +256,10 @@ GPU (`gpuN_power_w`), агрегатор считает энергию ступ�
 мощности трапециями по фактическим `dt` в окне `started_at_utc`/`finished_at_utc`;
 `power_avg_w` — средняя мощность; `energy_per_output_token_j` /
 `energy_per_input_token_j` — Дж на выходной/входной токен (J/request —
-`energy_j`); `energy_dynamic_j` вычитает idle-минимум суммарной мощности. Это
+`energy_j`); `energy_dynamic_j` вычитает baseline из idle-окна — медиану
+суммарной мощности за `IDLE_WINDOW_S` = 10 с перед первым запросом (fallback —
+минимум по прогону; источник — `idle_baseline_source`, поля `idle_baseline_w` /
+`idle_window_s`). Это
 **оценка** по телеметрии, а не прямое измерение счётчиком. Нужны метки
 `started_at_utc`/`finished_at_utc` на ступенях: без них или без телеметрии
 энергии нет — это **не блокер**, отчёт выводит явное «нет данных». Секция
