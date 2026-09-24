@@ -97,8 +97,11 @@ if [[ $# -eq 1 && "$1" =~ ^(report|plot|all)$ ]]; then
       python3 "$PLOT_SCRIPT" "${args[@]}"
     done
     for lang in ru en; do
-      for name in prefill-vs-context decode-vs-context ab-cache-hit; do
-        echo "wrote $FIGURES_DIR/$name.$lang.svg"
+      for name in prefill-vs-context decode-vs-context ab-cache-hit \
+        power-vs-load energy-per-token; do
+        if [[ -f "$FIGURES_DIR/$name.$lang.svg" ]]; then
+          echo "wrote $FIGURES_DIR/$name.$lang.svg"
+        fi
       done
     done
   }

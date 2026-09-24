@@ -43,7 +43,7 @@ is **not published**; a study describes its own rig in its local `HARDWARE.md`
 | 11 | Raw runs | `results/<run_id>/` | yes |
 | 12 | Telemetry | `results/<run_id>/telemetry.csv` | yes |
 | 13 | Aggregate tables + machine-readable summary | `docs/results-tables.md`, `docs/results.json` | yes |
-| 14 | Figures | `docs/figures/*.svg` | conditional: a figure is mandatory **when the corresponding measured series exists**. `plot_context_curves.py` builds three figures: `prefill-vs-context`, `decode-vs-context` (if a ladder was measured) and `ab-cache-hit` (under A/B). Additional per-axis plots (layout/ubatch/speculation) are built separately by the author when a series exists. If the series was not measured, the figure is not built and the reason is recorded in `README.md` |
+| 14 | Figures | `docs/figures/*.svg` | conditional: a figure is mandatory **when the corresponding measured series exists**. `plot_context_curves.py` builds five figures: the base ones `prefill-vs-context`, `decode-vs-context` (if a ladder was measured) and `ab-cache-hit` (under A/B), plus `power-vs-load` and `energy-per-token` when an energy series (power telemetry) exists. Additional per-axis plots (layout/ubatch/speculation) are built separately by the author when a series exists. If the series was not measured, the figure is not built and the reason is recorded in `README.md` |
 | 15 | Licenses | `LICENSE-NOTICE.md` | yes |
 | 16 | Publication barrier | `scripts/check-public.sh`, `scripts/sanitize-results.sh` (both copied from `methodology/scripts/publish/`) | yes |
 
@@ -199,36 +199,71 @@ service). An empty `prompts/` is not allowed.
 
 | File | Purpose |
 | --- | --- |
-| `result.json` | Run outcome: status, error, steps (prefill/decode, cache-hit, fixed generation), telemetry maxima, clocks |
+| `result.json` | Run outcome: status (`ok`/`failed`/`timeout`/`non_comparable`), error, structured `status_reasons`, steps (prefill/decode, cache-hit, fixed generation, `finish_reason`, `step_comparable`, `timing_delta_pct`, `overhead_s`), `props_check`/`offload_check`, telemetry maxima, clocks |
 | `profile.json` | Copy of the profile used (records the input as is) |
 | `command.json` | Actual command, environment, port, seed, mode/order |
 | `server.log` | Server stdout+stderr (buffers, warnings, errors) |
 | `telemetry.csv` | Samples (typically 0.5 s): RAM/swap, CPU, temperature, per-GPU temperature/utilization/memory/power; process memory |
 
-Failed runs are preserved with `status = failed` and the error text; they are
-neither deleted nor overwritten.
+Failed runs are preserved with the `failed`/`timeout`/`non_comparable` status and
+the error text/structured cause; they are neither deleted nor overwritten. A run
+with a broken invariant is marked `non_comparable` (fail-closed): on a `/props`
+mismatch the heavy requests are skipped, and the reasons go to `status_reasons`,
+`props_check`/`offload_check` (host offload; `CPU_Mapped` is mmap-backed weights,
+not an offload marker).
 
 ### 4.4. Aggregates `docs/`
 
 | File | Purpose |
 | --- | --- |
 | `docs/results-tables.md` | Human-readable summary tables over the canonical runs |
-| `docs/results.json` | Machine-readable summary: list of runs, canonical/control, steps |
-| `docs/figures/*.svg` | Figures (prefill/decode/comparisons); per language — `*.ru.svg` / `*.en.svg` |
+| `docs/results.json` | Machine-readable summary: list of runs, canonical/control, steps; per-step energy metrics (`energy_j`, `power_avg_w`, `energy_per_output_token_j`, …) and the paired A/B delta (`ab_delta`, key `"profile\|order"`) |
+| `docs/figures/*.svg` | Five auto-figures of `plot_context_curves.py`: `prefill-vs-context`, `decode-vs-context`, `ab-cache-hit`; `power-vs-load`, `energy-per-token` (the last two only when an energy series exists); per language — `*.ru.svg` / `*.en.svg` |
 
 The aggregators are **read-only** with respect to `results/`: they only read raw
-runs and write to `docs/`. The canonical result for a configuration/step is the
-**aggregate over repetitions**: **n ≥ 3** successful (`ok`) runs, aggregation —
-**median + min/max**, and `docs/results.json` records `n` and the list of
-`run_id`s of all included runs. At `n < 3` the result is marked
-limited/non-canonical. The selection rule and the list of canonical/control runs
-are recorded in `docs/results.json`; the norm is in `METHODOLOGY.md` §11.1
-(canonical run selection and aggregation), figures — §11.2.
+runs and write to `docs/`. The canonical result is the **aggregate over
+repetitions**, and canonicality is decided **per step** (not per run): a step
+enters the aggregate only when it is comparable — `completion_is_fixed = true`,
+`finish_reason = length` and `step_comparable != false` (for new runs the
+`step_comparable` field also covers `prompt_prefix_ok`; the aggregator checks
+the flag itself). The
+norm is **n ≥ 3** unique successful (`ok`) runs **per step**, aggregation —
+**median + min/max**; `docs/results.json` records `n` and the list of `run_id`s
+of all runs included in the step. Steps with **n < 3** are marked `limited` and
+**do not enter the main tables/figures** — they are shown in a separate section.
+The generation status of a run is `fixed` (all steps comparable), `mixed` (part)
+or `variable` (none); for `mixed` runs the comparable steps enter the aggregate.
+A single run's contribution to one `target_pct` is not duplicated; the profile
+`n` = the number of runs with **≥ 1** comparable step. The warm-up step `0 %`
+does not enter the aggregate. The selection rule and the list of
+canonical/control runs are recorded in `docs/results.json`; the norm is in
+`METHODOLOGY.md` §11.1 (canonical run selection and aggregation), figures —
+§11.2.
 
-> **Reference-implementation limitation.** The sample runner selects the "last
-> successful" run and does not aggregate repetitions. This is a reference
-> limitation, not the norm: the normative minimum is aggregation over
-> repetitions (n ≥ 3, median + min/max).
+> **Aggregation is done by the aggregator, not the runner.** The runner only
+> writes raw runs (`result.json` with steps and `step_comparable`); the portable
+> `generate_report.py` aggregates repetitions **per step** and marks as `limited`
+> whatever falls short of **n ≥ 3**.
+
+**Energy is an estimate from telemetry.** When `telemetry.csv` carries per-GPU
+power (`gpuN_power_w`), the aggregator computes the step energy: `energy_j` is
+the trapezoid integral of power over the actual `dt` inside the
+`started_at_utc`/`finished_at_utc` window; `power_avg_w` is the average power;
+`energy_per_output_token_j` / `energy_per_input_token_j` are joules per
+output/input token (J/request is `energy_j`); `energy_dynamic_j` subtracts the
+idle minimum of the total power. This is an **estimate** from telemetry, not a
+direct meter reading. Step labels `started_at_utc`/`finished_at_utc` are
+required: without them or without telemetry there is no energy — this is **not a
+blocker**, and the report prints an explicit "no data" line. The report section
+is "Energy and power" (`render_energy`); the per-step metrics land in
+`docs/results.json`.
+
+**Paired A/B delta.** When `ab-sequence` runs exist, the aggregator pairs the
+comparable steps of sessions A and B within one run, order and `target_pct` and
+computes delta = 100·(B−A)/A over the matching steps (median delta, `n_pairs`,
+`sign_consistency`); the `0 %` warm-up step is excluded. The result is the
+"Paired A/B delta" report section (`render_ab_delta`) and `ab_delta` in
+`docs/results.json` (key `"profile|order"`).
 
 ### 4.5. Study config `study.json`
 
@@ -410,13 +445,18 @@ bash scripts/check-public.sh
    `ab_planned`/`ab_orders` and `ladder_pcts`; when absent, auto-detection from
    the raw runs yields correct profiles and labels.
 10. `docs/results-tables.md`, `docs/results.json` and figures are generated from
-    the canonical runs. The canonical result is the aggregate over **n ≥ 3**
-    successful runs (**median + min/max**, with `n` and the list of `run_id`s
-     recorded); at `n < 3` the result is marked limited/non-canonical. A figure is
-     mandatory **when the corresponding measured series exists**: the three
+    the canonical runs. The canonical result is the aggregate over repetitions
+    **per step** (per-step canonicality): a step enters when it is comparable
+    (`completion_is_fixed` + `finish_reason = length` + `step_comparable`) and
+    has **n ≥ 3** unique `ok` runs at that step (**median + min/max**, with `n`
+    and the list of `run_id`s recorded); steps with `n < 3` are marked `limited`
+    and shown separately, outside the main tables/figures; the run status is
+     `fixed`/`mixed`/`variable`. A figure is mandatory **when the corresponding
+     measured series exists**: the five
      automatically generated figures of `plot_context_curves.py`
      (`prefill-vs-context`, `decode-vs-context` — if a ladder was measured;
-     `ab-cache-hit` — under A/B), while additional per-axis plots
+     `ab-cache-hit` — under A/B; `power-vs-load`, `energy-per-token` — when an
+     energy series exists), while additional per-axis plots
      (layout/ubatch/speculation) are built separately by the author when a series
      exists. If the series was not measured, the figure is not built and the
      reason is recorded in `README.md`.

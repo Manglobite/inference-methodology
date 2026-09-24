@@ -5,18 +5,37 @@ Reads `result.json` files from `<results-dir>/*/` and emits hand-written SVGs
 (no matplotlib, no external fonts/images) suitable for embedding in Markdown
 reports.
 
-Three figures are produced:
+Five figures are produced:
   1. prefill-vs-context   median prefill tok/s against context fill (percent
                           of ctx), one series per configured profile;
   2. decode-vs-context    median decode tok/s against context fill, same;
   3. ab-cache-hit         cache hit fraction in A/B order for `ab-sequence`
                           runs, one curve per `(profile, order)` so different
-                          orders never overwrite each other.
+                          orders never overwrite each other;
+  4. power-vs-load        median average power (`power_avg_w`, W) against
+                          context fill, one series per profile; the Y axis
+                          starts at zero;
+  5. energy-per-token     median energy per output token
+                          (`energy_per_output_token_j`, J/tok) against context
+                          fill, one series per profile. The Y axis is NOT
+                          anchored at zero because the values are small and
+                          close together; the axis label states this. When
+                          present, the baseline-corrected
+                          `energy_per_output_token_j_dynamic` is overlaid as a
+                          dashed grey series.
+
+The energy figures are skipped (with a warning) when no energy metrics exist in
+the results at all, e.g. legacy runs without telemetry.
 
 Ladder series come from the same per-step median aggregation as the report
-(METHODOLOGY.md section 11.1): `mode == "ladder"`, `status == "ok"`,
-`completion_is_fixed == true`, aggregated per `target_pct`; the 0% warm-up step
-is excluded. Profiles with role `control` are drawn dashed. When the config file
+(METHODOLOGY.md section 11.1): among `mode == "ladder"`, `status == "ok"` runs a
+step enters the series only when it is comparable — `completion_is_fixed ==
+true` AND `finish_reason == "length"` AND `step_comparable != false` (the exact
+test of `step_is_comparable` in `generate_report.py`); steps are aggregated per
+`target_pct`. Limited steps (fewer than `report.MIN_CANONICAL_N` runs, i.e.
+`n < 3`) are not plotted at all, so a non-canonical aggregate never appears as a
+curve point. The 0% warm-up step is excluded. Profiles with role `control` are
+drawn dashed. When the config file
 is absent, profiles, title and A/B orders are auto-detected from the raw runs;
 raw profile names are never disclosed: each series is shown as a neutral
 placeholder (`profile N`) and the missing-data warning reports only a count. No
@@ -57,6 +76,7 @@ SERIES_COLORS = [
 ]
 SESSION_COLORS = {"A": "#1f77b4", "B": "#d62728"}
 CONTROL_DASH = "6,4"
+OVERLAY_COLOR = "#888888"
 
 LABELS = {
     "ru": {
@@ -74,6 +94,22 @@ LABELS = {
             "points": "точек",
             "no_data_for": "нет данных по",
         },
+        "power": {
+            "title": "Мощность против заполнения контекста",
+            "xlabel": "Заполненность контекста, % от ctx",
+            "ylabel": "Средняя мощность, Вт (ось Y от нуля)",
+            "points": "точек",
+            "no_data_for": "нет данных по",
+        },
+        "energy": {
+            "title": "Энергия на выходной токен против заполнения контекста",
+            "xlabel": "Заполненность контекста, % от ctx",
+            "ylabel": "Энергия на выходной токен, Дж/tok (ось Y не от нуля)",
+            "points": "точек",
+            "no_data_for": "нет данных по",
+            "dynamic": "динамическая",
+            "note": "серии — медианы comparable-ступеней; ось Y не привязана к нулю, значения малы",
+        },
         "ab": {
             "title": "A/B-кеш: доля попаданий по порядку обращений",
             "xlabel": "Порядок обращений",
@@ -82,8 +118,12 @@ LABELS = {
             "session_b": "сессия B",
             "note": "порядки показаны раздельно; cache-hit от рантайма не зависит",
         },
-        "canonical_note": "серии — медианный агрегат fixed-прогонов (completion_is_fixed)",
+        "no_energy_data": "нет энергетических метрик в results (старый формат) — фигуры мощности/энергии не построены",
+        "figure_skipped": "фигура {figure} не построена: нет точек",
+        "canonical_note": "серии — медианный агрегат comparable-ступеней (`completion_is_fixed` + `finish_reason=length` + `step_comparable != false`); limited-ступени (n<3) пропущены",
         "limited": "limited",
+        "skipped_limited": "пропущено limited-ступеней",
+        "skipped_limited_metrics": "limited-ступени не показаны (n<3): профилей: {p}, ступеней: {s}",
         "points": "точек",
         "no_data_for": "нет данных по",
         "no_data_count": "нет данных по профилям: {n}",
@@ -104,6 +144,22 @@ LABELS = {
             "points": "points",
             "no_data_for": "no data for",
         },
+        "power": {
+            "title": "Power vs context fill",
+            "xlabel": "Context fill, % of ctx",
+            "ylabel": "Average power, W (Y axis from zero)",
+            "points": "points",
+            "no_data_for": "no data for",
+        },
+        "energy": {
+            "title": "Energy per output token vs context fill",
+            "xlabel": "Context fill, % of ctx",
+            "ylabel": "Energy per output token, J/tok (Y axis not from zero)",
+            "points": "points",
+            "no_data_for": "no data for",
+            "dynamic": "dynamic",
+            "note": "series are comparable-step medians; the Y axis is not anchored at zero, values are small",
+        },
         "ab": {
             "title": "A/B cache: hit fraction by request order",
             "xlabel": "Request order",
@@ -112,8 +168,12 @@ LABELS = {
             "session_b": "session B",
             "note": "orders are shown separately; cache-hit does not depend on the runtime",
         },
-        "canonical_note": "series use the median aggregate of fixed runs (completion_is_fixed)",
+        "no_energy_data": "no energy metrics in results (legacy format) — power/energy figures not built",
+        "figure_skipped": "figure {figure} not built: no points",
+        "canonical_note": "series use the median aggregate of comparable steps (`completion_is_fixed` + `finish_reason=length` + `step_comparable != false`); limited steps (n<3) skipped",
         "limited": "limited",
+        "skipped_limited": "skipped limited steps",
+        "skipped_limited_metrics": "limited steps not shown (n<3): profiles: {p}, steps: {s}",
         "points": "points",
         "no_data_for": "no data for",
         "no_data_count": "no data for {n} profile(s)",
@@ -135,12 +195,33 @@ def fmt_number(value, digits=2):
     return f"{value:.{digits}f}"
 
 
+def metric_value(stat):
+    """Numeric value of an aggregated metric entry, or None when absent.
+
+    A valid `0.0` is a value, not a missing series: the check is an explicit
+    `report.is_number` (which rejects `bool`) instead of truthiness. The
+    aggregator may expose a metric either as a plain number or as a
+    `{"median": ...}` stat dict; both shapes are accepted.
+    """
+    if isinstance(stat, dict):
+        stat = stat.get("median")
+    return stat if report.is_number(stat) else None
+
+
+def has_series_points(series):
+    """True when at least one profile series carries at least one point."""
+    return any(info["points"] for info in series.values())
+
+
 def series_from_aggregated(aggregation, cfg, metric):
     """One median curve per configured profile from its ladder aggregate.
 
     The X axis is the requested context fill (`target_pct`) and the Y value is
-    the per-step median of `metric`. Returns `{profile: {"points": [...],
-    "n": int, "limited": bool, "run_ids": [...]}}`.
+    the per-step median of `metric`. Steps below the canonical minimum
+    (`limited`, `n < report.MIN_CANONICAL_N`) are skipped so a non-canonical
+    aggregate never appears as a curve point. Returns
+    `{profile: {"points": [...], "n": int, "limited": bool, "run_ids": [...],
+    "skipped_limited": [...]}}`.
     """
     series = {}
     for name in report.profile_names(cfg):
@@ -148,11 +229,16 @@ def series_from_aggregated(aggregation, cfg, metric):
         if not aggregate:
             continue
         points = []
+        skipped_limited = []
         for step in aggregate["steps"]:
-            stat = step["metrics"].get(metric)
-            if not stat:
+            if step.get("limited") or step.get("n", 0) < report.MIN_CANONICAL_N:
+                skipped_limited.append(int(step["target_pct"]))
                 continue
-            points.append((float(step["target_pct"]), float(stat["median"])))
+            stat = step["metrics"].get(metric)
+            value = metric_value(stat)
+            if value is None:
+                continue
+            points.append((float(step["target_pct"]), float(value)))
         if points:
             points.sort(key=lambda item: item[0])
             series[name] = {
@@ -160,6 +246,7 @@ def series_from_aggregated(aggregation, cfg, metric):
                 "n": aggregate["n"],
                 "limited": aggregate["limited"],
                 "run_ids": aggregate["run_ids"],
+                "skipped_limited": skipped_limited,
             }
     return series
 
@@ -282,10 +369,17 @@ def display_label(cfg, name, lang, configured, order):
 
 def series_label(label, lang, info, point_word):
     suffix = f" [{LABELS[lang]['limited']} n={info['n']}]" if info.get("limited") else ""
+    skipped = info.get("skipped_limited") or []
+    if skipped:
+        suffix += (
+            f" [{LABELS[lang]['skipped_limited']}: "
+            + ", ".join(str(pct) for pct in skipped) + "]"
+        )
     return f"{label} ({len(info['points'])} {point_word}){suffix}"
 
 
-def build_curve_svg(series, labels, cfg, lang, x_max, y_max, control_names, configured, order):
+def build_curve_svg(series, labels, cfg, lang, x_max, y_max, control_names, configured, order,
+                    y_min=0.0, y_digits=0, overlay=None, note=None):
     height = HEIGHT
     plot_x0 = MARGIN_LEFT
     plot_x1 = WIDTH - MARGIN_RIGHT
@@ -298,7 +392,8 @@ def build_curve_svg(series, labels, cfg, lang, x_max, y_max, control_names, conf
         return plot_x0 + (value / x_max) * plot_w if x_max else plot_x0
 
     def sy(value):
-        return plot_y1 - (value / y_max) * plot_h if y_max else plot_y1
+        span = y_max - y_min
+        return plot_y1 - ((value - y_min) / span) * plot_h if span else plot_y1
 
     title = f"{labels['title']} \u2014 {study_title(cfg, lang)}"
     parts = svg_open(title)
@@ -311,7 +406,7 @@ def build_curve_svg(series, labels, cfg, lang, x_max, y_max, control_names, conf
 
     x_tick_count = 5
     x_ticks = [x_max * index / x_tick_count for index in range(x_tick_count + 1)]
-    y_ticks = nice_ticks(0.0, y_max)
+    y_ticks = nice_ticks(y_min, y_max)
 
     for tick in x_ticks:
         x = sx(tick)
@@ -328,7 +423,7 @@ def build_curve_svg(series, labels, cfg, lang, x_max, y_max, control_names, conf
     for tick in x_ticks:
         add_text(parts, sx(tick), plot_y1 + 22, f"{int(tick)}%", anchor="middle")
     for tick in y_ticks:
-        add_text(parts, plot_x0 - 12, sy(tick) + 4, fmt_number(tick, digits=0), anchor="end")
+        add_text(parts, plot_x0 - 12, sy(tick) + 4, fmt_number(tick, digits=y_digits), anchor="end")
 
     parts.append(
         f'<line x1="{plot_x0}" y1="{plot_y1}" x2="{plot_x1}" y2="{plot_y1}" '
@@ -341,7 +436,8 @@ def build_curve_svg(series, labels, cfg, lang, x_max, y_max, control_names, conf
     add_text(parts, (plot_x0 + plot_x1) / 2, plot_y1 + 52, labels["xlabel"], size=15, anchor="middle")
     add_text(parts, 26, (plot_y0 + plot_y1) / 2, labels["ylabel"], size=15, anchor="middle", rotate=-90)
     add_text(parts, WIDTH / 2, 34, title, size=17, anchor="middle", weight="bold")
-    add_text(parts, WIDTH / 2, 56, LABELS[lang]["canonical_note"], size=12, anchor="middle")
+    add_text(parts, WIDTH / 2, 56, note if note is not None else LABELS[lang]["canonical_note"],
+             size=12, anchor="middle")
 
     entries = []
     parts.append('<g clip-path="url(#plotClip)">')
@@ -364,6 +460,28 @@ def build_curve_svg(series, labels, cfg, lang, x_max, y_max, control_names, conf
         )
         for x, y in points:
             parts.append(marker_svg("circle", sx(x), sy(y), color))
+    for index, name in enumerate(sorted(overlay or {})):
+        info = overlay[name]
+        points = info["points"]
+        if not points:
+            continue
+        dash = DASH_STYLES[index % len(DASH_STYLES)] or CONTROL_DASH
+        marker = MARKER_SHAPES[index % len(MARKER_SHAPES)]
+        label = f"{display_label(cfg, name, lang, configured, order)} \u2014 {labels['dynamic']}"
+        entries.append({
+            "color": OVERLAY_COLOR,
+            "text": series_label(label, lang, info, labels["points"]),
+            "marker": marker,
+            "dash": dash,
+        })
+        coords = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in points)
+        parts.append(
+            f'<polyline fill="none" stroke="{OVERLAY_COLOR}" stroke-width="2.2" '
+            f'stroke-linejoin="round" stroke-linecap="round" '
+            f'stroke-dasharray="{dash}" points="{coords}"/>'
+        )
+        for x, y in points:
+            parts.append(marker_svg(marker, sx(x), sy(y), OVERLAY_COLOR))
     parts.append("</g>")
     missing = [name for name in report.profile_names(cfg, "main") if name not in series]
     for name in missing:
@@ -502,7 +620,19 @@ def main():
 
     prefill = series_from_aggregated(aggregation, cfg, "prefill_tokens_per_second")
     decode = series_from_aggregated(aggregation, cfg, "decode_tokens_per_second")
+    power = series_from_aggregated(aggregation, cfg, "power_avg_w")
+    energy = series_from_aggregated(aggregation, cfg, "energy_per_output_token_j")
+    energy_dynamic = series_from_aggregated(aggregation, cfg, "energy_per_output_token_j_dynamic")
     ab = ab_series(runs)
+
+    energy_present = any(
+        metric_value(step["metrics"].get(key)) is not None
+        for aggregate in aggregation.values()
+        for step in aggregate.get("steps") or []
+        for key in report.ENERGY_METRIC_KEYS
+    )
+    if not energy_present:
+        print("warning: " + labels["no_energy_data"])
 
     missing = [name for name in report.profile_names(cfg, "main") if name not in prefill]
     unnamed = [name for name in missing if name not in configured]
@@ -513,9 +643,24 @@ def main():
     if unnamed:
         print("warning: " + labels["no_data_count"].format(n=len(unnamed)))
 
+    skipped = set()
+    for name, aggregate in aggregation.items():
+        for step in aggregate.get("steps") or []:
+            if step.get("limited") or step.get("n", 0) < report.MIN_CANONICAL_N:
+                skipped.add((name, int(step["target_pct"])))
+    if skipped:
+        print(
+            "warning: " + labels["skipped_limited_metrics"].format(
+                p=len({name for name, _ in skipped}), s=len(skipped)
+            )
+        )
+
     x_candidates = [
         x
-        for series in list(prefill.values()) + list(decode.values())
+        for series in (
+            list(prefill.values()) + list(decode.values())
+            + list(power.values()) + list(energy.values()) + list(energy_dynamic.values())
+        )
         for x, _ in series["points"]
     ]
     x_max = max([100.0] + x_candidates) * 1.05
@@ -525,6 +670,25 @@ def main():
     decode_max = max(
         [1.0] + [y for series in decode.values() for _, y in series["points"]]
     ) * 1.10
+    power_max = max(
+        [1.0] + [y for series in power.values() for _, y in series["points"]]
+    ) * 1.10
+    energy_values = [
+        y
+        for series in list(energy.values()) + list(energy_dynamic.values())
+        for _, y in series["points"]
+    ]
+    if energy_values:
+        e_min = min(energy_values)
+        e_max = max(energy_values)
+        e_span = e_max - e_min
+        if e_span <= 0:
+            e_span = abs(e_max) or 1.0
+        energy_min = max(0.0, e_min - e_span * 0.15)
+        energy_max = e_max + e_span * 0.15
+        energy_digits = 3 if energy_max < 1 else (2 if energy_max < 10 else 1)
+    else:
+        energy_min, energy_max, energy_digits = 0.0, 1.0, 2
 
     figures = [
         ("prefill-vs-context",
@@ -538,6 +702,26 @@ def main():
         ("ab-cache-hit", build_ab_svg(ab, labels["ab"], cfg, args.lang, configured, order),
          sum(len(points["A"]) + len(points["B"]) for points in ab.values())),
     ]
+    if has_series_points(power):
+        figures.append((
+            "power-vs-load",
+            build_curve_svg(power, labels["power"], cfg, args.lang, x_max, power_max,
+                            control_names, configured, order),
+            sum(len(series["points"]) for series in power.values()),
+        ))
+    else:
+        print("warning: " + labels["figure_skipped"].format(figure="power-vs-load"))
+    if has_series_points(energy):
+        figures.append((
+            "energy-per-token",
+            build_curve_svg(energy, labels["energy"], cfg, args.lang, x_max, energy_max,
+                            control_names, configured, order, y_min=energy_min,
+                            y_digits=energy_digits, overlay=energy_dynamic or None,
+                            note=labels["energy"]["note"]),
+            sum(len(series["points"]) for series in energy.values()),
+        ))
+    else:
+        print("warning: " + labels["figure_skipped"].format(figure="energy-per-token"))
     for name, svg, count in figures:
         out = args.out_dir / f"{name}.{args.lang}.svg"
         out.write_text(svg, encoding="utf-8")

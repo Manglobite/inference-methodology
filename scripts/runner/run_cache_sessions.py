@@ -18,8 +18,10 @@ bypass that service.
 
 Only the standard library is required. Host/GPU telemetry (schema version 1,
 METHODOLOGY section 10) and the llama-server process memory are sampled every
-0.5 s into `telemetry.csv`; each run writes `result.json` (failed runs are
-preserved with status=failed and the error).
+0.5 s into `telemetry.csv`; each run writes `result.json`. A run is preserved on
+failure: the status is `failed` or `timeout`, and a run whose invariants break
+(`/props` mismatch, host offload) is `non_comparable` with the reasons in
+`status_reasons`.
 
 `--profile` is resolved against `--case-dir` first and against the current
 working directory second; a relative path found in neither is a clear error.
@@ -40,12 +42,18 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+STATUS_OK = "ok"
+STATUS_FAILED = "failed"
+STATUS_TIMEOUT = "timeout"
+STATUS_NON_COMPARABLE = "non_comparable"
 
 STEP_TIMEOUT_S = 7200
 HEALTH_TIMEOUT_S = 900
@@ -54,6 +62,8 @@ TELEMETRY_SCHEMA_VERSION = 1
 LADDER_PCTS = (10, 30, 60, 80)
 SMOKE_MAX_TOKENS = 32
 SMOKE_PROMPT = "2+2"
+# Host buffers at or below this (MiB) are rounding noise and count as zero.
+OFFLOAD_NONZERO_MIB = 0.01
 CLOCKS_QUERY = ["nvidia-smi", "--query-gpu=index,clocks.current.graphics,pstate", "--format=csv,noheader,nounits"]
 GPU_QUERY = [
     "nvidia-smi",
@@ -85,6 +95,24 @@ LOG_BUFFER_PATTERNS = (
     ("n_ctx", re.compile(r"\bn_ctx\s*=\s*(?P<value>\d+)")),
     ("flash_attn", re.compile(r"flash_attn\s*=\s*(?P<value>\S+)")),
 )
+# `offloaded X/Y layers to GPU` with X < Y is the direct partial-offload marker.
+OFFLOAD_LAYERS_PATTERN = re.compile(
+    r"offloaded\s+(?P<offloaded>\d+)/(?P<total>\d+)\s+layers to GPU"
+)
+# KV on a CPU/host device is a host-KV marker; `CUDA_Host` output/compute buffers
+# are normal staging and deliberately not matched here.
+HOST_KV_PATTERN = re.compile(
+    r"(?:CUDA_Host|CPU[0-9]?)\s+KV buffer size\s*=\s*(?P<value>[^\n,]+)"
+)
+# A plain `CPU model buffer size` (not the mmap-backed `CPU_Mapped` line) means
+# weights actually held on the CPU.
+HOST_MODEL_PATTERN = re.compile(
+    r"CPU[0-9]?\s+model buffer size\s*=\s*(?P<value>[^\n,]+)"
+)
+# `CPU_Mapped model buffer size` is mmap-backed weight storage, not offload.
+CPU_MAPPED_MODEL_PATTERN = re.compile(
+    r"CPU_Mapped model buffer size\s*=\s*(?P<value>[^\n,]+)"
+)
 PEVAL_PATTERN = re.compile(
     r"prompt eval time =\s*(?P<milliseconds>[\d.]+) ms /\s*(?P<tokens>\d+) tokens "
     r"\([^,]+,\s*(?P<tokens_per_second>[\d.]+) tokens per second\)"
@@ -99,6 +127,75 @@ FILLER_UNIT = (
     "пересказывай предыдущие фрагменты.\n"
 )
 SESSION_MARKERS = {"A": "Сессия A: начало приватного контекста.\n", "B": "Сессия B: начало приватного контекста.\n"}
+_RUN_ID_COUNTER = itertools.count()
+
+
+def classify_status(exc):
+    """Map an exception to a run status: timeouts vs everything else."""
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return STATUS_TIMEOUT
+    return STATUS_FAILED
+
+
+def invariant_reason(code, detail):
+    """Structured status reason for an invariant violation (non-comparable)."""
+    return {"kind": "invariant", "code": code, "detail": detail}
+
+
+def exception_reason(code, detail):
+    """Structured status reason for an exception that ended the run."""
+    return {"kind": "exception", "code": code, "detail": detail}
+
+
+def mark_non_comparable(report, reasons):
+    """Append non-comparability reasons; downgrade ok -> non_comparable only."""
+    for reason in reasons:
+        report["status_reasons"].append(reason)
+        report["invariants_failed"] = True
+        report["non_comparable_was_flagged"] = True
+    if reasons and report["status"] == STATUS_OK:
+        report["status"] = STATUS_NON_COMPARABLE
+
+
+def step_comparable(entry, prefix_ok):
+    """A step is comparable only when decoding was full-length and in order."""
+    return (
+        entry.get("completion_is_fixed") is True
+        and entry.get("finish_reason") == "length"
+        and prefix_ok is True
+    )
+
+
+def timing_delta_pct(api_value, log_value):
+    """Percent divergence of an API timing from the log timing; None if absent."""
+    if api_value is None or log_value is None or log_value == 0:
+        return None
+    return round(100.0 * (api_value - log_value) / log_value, 3)
+
+
+def canonical_speed_from_sources(api_value, log_value, api_tokens, log_tokens):
+    """Pick the canonical speed and its source for one timing metric.
+
+    The raw server.log timing is canonical (METHODOLOGY section 8). It is
+    accepted when its token count matches this request's own token count
+    (`confirmed=True`); when the API exposes no token count there is nothing to
+    cross-check against, so the log is still accepted as primary
+    (`confirmed=False`). A log block whose token count differs from a known API
+    token count is a foreign/previous block and is rejected as a mismatch, in
+    which case the API timing is the fallback. Returns {"value", "source",
+    "mismatch", "confirmed"}, where `source` is "log", "api" or None.
+    """
+    if log_value is not None and log_tokens is not None:
+        if api_tokens is None:
+            return {"value": log_value, "source": "log", "mismatch": False, "confirmed": False}
+        if api_tokens == log_tokens:
+            return {"value": log_value, "source": "log", "mismatch": False, "confirmed": True}
+        if api_value is not None:
+            return {"value": api_value, "source": "api", "mismatch": True, "confirmed": False}
+        return {"value": None, "source": None, "mismatch": True, "confirmed": False}
+    if api_value is not None:
+        return {"value": api_value, "source": "api", "mismatch": False, "confirmed": False}
+    return {"value": None, "source": None, "mismatch": False, "confirmed": False}
 
 
 def request_json(base_url, path, payload=None, timeout=STEP_TIMEOUT_S):
@@ -421,6 +518,97 @@ def snapshot_props(base_url):
     }
 
 
+def check_props(props, ctx_size, parallel):
+    """Compare /props against the profile; a mismatch makes a run non-comparable."""
+    actual_n_ctx = props.get("n_ctx")
+    actual_total_slots = props.get("total_slots")
+    n_ctx_ok = actual_n_ctx == ctx_size
+    total_slots_ok = actual_total_slots == parallel
+    reasons = []
+    if not n_ctx_ok:
+        reasons.append(invariant_reason(
+            "props_n_ctx_mismatch",
+            f"props n_ctx {actual_n_ctx!r} != profile ctx_size {ctx_size!r}",
+        ))
+    if not total_slots_ok:
+        reasons.append(invariant_reason(
+            "props_total_slots_mismatch",
+            f"props total_slots {actual_total_slots!r} != profile parallel {parallel!r}",
+        ))
+    return {
+        "ok": n_ctx_ok and total_slots_ok,
+        "n_ctx": {"actual": actual_n_ctx, "expected": ctx_size, "ok": n_ctx_ok},
+        "total_slots": {
+            "actual": actual_total_slots,
+            "expected": parallel,
+            "ok": total_slots_ok,
+        },
+        "props": props,
+        "reasons": reasons,
+    }
+
+
+def _nonzero_mib(raw_value):
+    """True when a buffer-size string is above the rounding-noise floor."""
+    cleaned = _clean_buffer_value(raw_value)
+    try:
+        number = float(cleaned)
+    except (TypeError, ValueError):
+        return False
+    return number > OFFLOAD_NONZERO_MIB
+
+
+def check_offload(log_text):
+    """Detect actual host offload from a server.log; non-comparable if found.
+
+    `offloaded X/Y layers to GPU` with X < Y is by itself an invariant
+    violation: the layers below Y keep their weights outside the GPU. CPU-held
+    model/KV buffers (`CPU model buffer size`, host `KV buffer size`) are
+    independent signals of offload. `CPU_Mapped model buffer size` is
+    mmap-backed weight storage and is recorded for information only, never a
+    reason. `CUDA_Host` output/compute buffers are normal staging.
+    """
+    parsed = parse_server_log(log_text)
+    buffers = parsed.get("log_buffers") or {}
+    mapped_matches = CPU_MAPPED_MODEL_PATTERN.findall(log_text)
+    mapped_raw = mapped_matches[-1].strip() if mapped_matches else None
+    mapped_mib = _clean_buffer_value(mapped_raw) if mapped_raw is not None else None
+    partial_layers = [
+        f"{match.group('offloaded')}/{match.group('total')}"
+        for match in OFFLOAD_LAYERS_PATTERN.finditer(log_text)
+        if int(match.group("offloaded")) < int(match.group("total"))
+    ]
+    host_kv_values = [value.strip().strip(",") for value in HOST_KV_PATTERN.findall(log_text)]
+    host_model_values = [value.strip().strip(",") for value in HOST_MODEL_PATTERN.findall(log_text)]
+    host_kv = any(_nonzero_mib(value) for value in host_kv_values)
+    host_model = any(_nonzero_mib(value) for value in host_model_values)
+    reasons = []
+    if partial_layers:
+        reasons.append(invariant_reason(
+            "partial_layer_offload",
+            f"offloaded layers below total: {partial_layers}",
+        ))
+    if host_model:
+        reasons.append(invariant_reason(
+            "host_model_buffer",
+            f"CPU model buffer size present: {host_model_values}",
+        ))
+    if host_kv:
+        reasons.append(invariant_reason(
+            "host_kv_buffer",
+            f"host KV buffer size present: {host_kv_values}",
+        ))
+    return {
+        "ok": not reasons,
+        "cpu_mapped_mib": mapped_mib,
+        "partial_layer_offloads": partial_layers,
+        "host_kv_buffer": host_kv,
+        "host_model_buffer": host_model,
+        "log_buffers": buffers,
+        "reasons": reasons,
+    }
+
+
 def run_smoke(base_url, profile):
     model = profile["served_model_name"]
     props = snapshot_props(base_url)
@@ -603,30 +791,110 @@ def parse_log_timings(text):
     return result
 
 
-def run_request(base_url, model, prompt, max_tokens, seed, log_path):
+def run_request(base_url, model, prompt, max_tokens, seed, log_path, cache_prompt=True):
+    """Issue one chat request and attach canonical (log-first) timing metrics.
+
+    The canonical `prefill_tokens_per_second`/`decode_tokens_per_second` come
+    from the raw server.log block when its token count matches this request's
+    own token count, or when the API exposes no token count to cross-check
+    (METHODOLOGY section 8); a known mismatch falls back to the API timing.
+    Both sources are kept explicitly and `timings_source` records which one is
+    canonical and whether the log was confirmed by an independent API count.
+    """
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "seed": seed,
-        "cache_prompt": True,
+        "cache_prompt": cache_prompt,
         "stream": False,
         # Generate exactly max_tokens so decode tok/s is measured on a comparable sample.
         "ignore_eos": True,
     }
     offset = log_path.stat().st_size if log_path.exists() else 0
     started = time.perf_counter()
+    started_utc = dt.datetime.now(dt.timezone.utc)
     response = request_json(base_url, "/v1/chat/completions", payload, timeout=STEP_TIMEOUT_S)
+    finished_utc = dt.datetime.now(dt.timezone.utc)
     elapsed = time.perf_counter() - started
     entry = extract_metrics(response, max_tokens)
+    entry["started_at_utc"] = started_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    entry["finished_at_utc"] = finished_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     entry["elapsed_s"] = round(elapsed, 3)
     choices = response.get("choices") or [{}]
     entry["finish_reason"] = choices[0].get("finish_reason")
+    timings = response.get("timings") or {}
     time.sleep(0.4)
     with log_path.open() as handle:
         handle.seek(offset)
         log_timings = parse_log_timings(handle.read())
+    api_prefill = timings.get("prompt_per_second")
+    if api_prefill is None and entry["evaluated_tokens"] and timings.get("prompt_ms"):
+        api_prefill = entry["evaluated_tokens"] / (timings["prompt_ms"] / 1000.0)
+    api_decode = timings.get("predicted_per_second")
+    if api_decode is None and entry["completion_tokens"] and timings.get("predicted_ms"):
+        api_decode = entry["completion_tokens"] / (timings["predicted_ms"] / 1000.0)
+    log_prefill = log_timings.get("prompt_eval_tokens_per_second")
+    log_decode = log_timings.get("eval_tokens_per_second")
+    log_prefill_tokens = log_timings.get("prompt_eval_tokens")
+    log_decode_tokens = log_timings.get("eval_tokens")
+    # Capture the API token counts before the log backfill below, so the
+    # canonical-source guard compares like with like (METHODOLOGY section 8):
+    # the log is primary, confirmed only when an independent API count matches.
+    api_eval_tokens = entry["evaluated_tokens"]
+    api_completion_tokens = entry["completion_tokens"]
+    prefill = canonical_speed_from_sources(
+        api_prefill,
+        log_prefill,
+        api_eval_tokens,
+        log_prefill_tokens,
+    )
+    decode = canonical_speed_from_sources(
+        api_decode,
+        log_decode,
+        api_completion_tokens,
+        log_decode_tokens,
+    )
+    entry["prefill_tokens_per_second"] = (
+        round(prefill["value"], 3) if prefill["value"] is not None else None
+    )
+    entry["decode_tokens_per_second"] = (
+        round(decode["value"], 3) if decode["value"] is not None else None
+    )
+    entry["prefill_tokens_per_second_api"] = round(api_prefill, 3) if api_prefill is not None else None
+    entry["prefill_tokens_per_second_log"] = round(log_prefill, 3) if log_prefill is not None else None
+    entry["decode_tokens_per_second_api"] = round(api_decode, 3) if api_decode is not None else None
+    entry["decode_tokens_per_second_log"] = round(log_decode, 3) if log_decode is not None else None
+    entry["timings_source"] = {
+        "prefill": prefill["source"],
+        "decode": decode["source"],
+        "confirmed": {"prefill": prefill["confirmed"], "decode": decode["confirmed"]},
+    }
+    entry["timing_delta_pct"] = {
+        "prefill": timing_delta_pct(api_prefill, log_prefill),
+        "decode": timing_delta_pct(api_decode, log_decode),
+    }
+    entry["log_timing_mismatch"] = prefill["mismatch"] or decode["mismatch"]
+    entry["log_timing_mismatch_details"] = {
+        "prefill": {
+            "mismatch": prefill["mismatch"],
+            "expected_tokens": api_eval_tokens if api_eval_tokens is not None else log_prefill_tokens,
+            "log_tokens": log_prefill_tokens,
+        },
+        "decode": {
+            "mismatch": decode["mismatch"],
+            "expected_tokens": api_completion_tokens if api_completion_tokens is not None else log_decode_tokens,
+            "log_tokens": log_decode_tokens,
+        },
+    }
+    entry["client_ttft_s"] = None
+    prompt_ms = timings.get("prompt_ms")
+    predicted_ms = timings.get("predicted_ms")
+    if prompt_ms is not None and predicted_ms is not None:
+        entry["overhead_s"] = round(elapsed - (prompt_ms + predicted_ms) / 1000.0, 3)
+    else:
+        entry["overhead_s"] = None
     if log_timings:
         if entry["evaluated_tokens"] is None and "prompt_eval_tokens" in log_timings:
             entry["evaluated_tokens"] = log_timings["prompt_eval_tokens"]
@@ -634,25 +902,21 @@ def run_request(base_url, model, prompt, max_tokens, seed, log_path):
                 entry["cache_hit_fraction"] = round(
                     max(0.0, 1.0 - entry["evaluated_tokens"] / entry["prompt_tokens"]), 4
                 )
-        if entry["prefill_tokens_per_second"] is None and "prompt_eval_tokens_per_second" in log_timings:
-            entry["prefill_tokens_per_second"] = round(log_timings["prompt_eval_tokens_per_second"], 3)
-        if entry["decode_tokens_per_second"] is None and "eval_tokens_per_second" in log_timings:
-            entry["decode_tokens_per_second"] = round(log_timings["eval_tokens_per_second"], 3)
         entry["log_timings"] = log_timings
     return entry
 
 
-def build_targets(ctx_size):
+def build_targets(ctx_size, ladder_pcts=None):
+    pcts = LADDER_PCTS if ladder_pcts is None else tuple(ladder_pcts)
     return [{"step": 0, "target_pct": 0, "target_tokens": 0}] + [
         {"step": index, "target_pct": pct, "target_tokens": int(ctx_size * pct / 100)}
-        for index, pct in enumerate(LADDER_PCTS, start=1)
+        for index, pct in enumerate(pcts, start=1)
     ]
 
 
-def run_ladder(base_url, profile, targets, seed, log_path):
+def run_ladder(base_url, profile, targets, seed, log_path, records, cache_prompt=True):
     model = profile["served_model_name"]
     max_tokens = int(profile.get("n_predict", 128))
-    records = []
     prompt = "Привет"
     prompt_tokens = token_count(base_url, prompt)
     previous_prompt = None
@@ -660,7 +924,7 @@ def run_ladder(base_url, profile, targets, seed, log_path):
         if target["target_tokens"] > 0:
             prompt, prompt_tokens = make_text(base_url, "Привет", target["target_tokens"])
         prefix_ok = True if previous_prompt is None else prompt.startswith(previous_prompt)
-        entry = run_request(base_url, model, prompt, max_tokens, seed, log_path)
+        entry = run_request(base_url, model, prompt, max_tokens, seed, log_path, cache_prompt)
         entry.update({
             "step": target["step"],
             "target_pct": target["target_pct"],
@@ -668,6 +932,7 @@ def run_ladder(base_url, profile, targets, seed, log_path):
             "raw_prompt_tokens": prompt_tokens,
             "prompt_prefix_ok": prefix_ok,
         })
+        entry["step_comparable"] = step_comparable(entry, prefix_ok)
         previous_prompt = prompt
         records.append(entry)
         print(
@@ -681,7 +946,7 @@ def run_ladder(base_url, profile, targets, seed, log_path):
     return records
 
 
-def run_ab_sequence(base_url, profile, targets, order, seed, log_path):
+def run_ab_sequence(base_url, profile, targets, order, seed, log_path, records, cache_prompt=True):
     """Interleave two sessions, one ladder rung per visit, following `order`.
 
     `order` is a repeating pattern (e.g. `ABAB`, `ABBABAA`); it is cycled
@@ -699,7 +964,6 @@ def run_ab_sequence(base_url, profile, targets, order, seed, log_path):
     prompt_tokens = {"A": token_count(base_url, prompts["A"]), "B": token_count(base_url, prompts["B"])}
     previous_prompts = {"A": None, "B": None}
     counters = {"A": 0, "B": 0}
-    records = []
     for order_index, session in enumerate(itertools.cycle(order)):
         if all(counters[name] >= len(targets) for name in sessions):
             break
@@ -713,7 +977,7 @@ def run_ab_sequence(base_url, profile, targets, order, seed, log_path):
             )
         earlier = previous_prompts[session]
         prefix_ok = True if earlier is None else prompts[session].startswith(earlier)
-        entry = run_request(base_url, model, prompts[session], max_tokens, seed, log_path)
+        entry = run_request(base_url, model, prompts[session], max_tokens, seed, log_path, cache_prompt)
         entry.update({
             "order_index": order_index,
             "session": session,
@@ -723,6 +987,7 @@ def run_ab_sequence(base_url, profile, targets, order, seed, log_path):
             "raw_prompt_tokens": prompt_tokens[session],
             "prompt_prefix_ok": prefix_ok,
         })
+        entry["step_comparable"] = step_comparable(entry, prefix_ok)
         previous_prompts[session] = prompts[session]
         records.append(entry)
         print(
@@ -733,7 +998,7 @@ def run_ab_sequence(base_url, profile, targets, order, seed, log_path):
             f"decode={entry['decode_tokens_per_second']}",
             flush=True,
         )
-    return {"order": order, "steps": records}
+    return {"order": order}
 
 
 def resolve_command(command, port, n_predict, repo_root):
@@ -813,7 +1078,10 @@ def main():
     if clock_reset_devices is not None:
         clock_reset_devices = str(clock_reset_devices)
 
-    run_id = f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{profile['name']}-{args.mode}"
+    run_id = (
+        f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')[:-3]}"
+        f"-{profile['name']}-{args.mode}-{os.getpid()}-{next(_RUN_ID_COUNTER)}"
+    )
     result_dir = results_dir / run_id
     result_dir.mkdir(parents=True, exist_ok=False)
     (result_dir / "command.json").write_text(json.dumps({
@@ -831,7 +1099,11 @@ def main():
     }, indent=2, ensure_ascii=False) + "\n")
     (result_dir / "profile.json").write_text(json.dumps(profile, indent=2, ensure_ascii=False) + "\n")
 
-    targets = build_targets(ctx_size)
+    ladder_pcts = profile.get("ladder_pcts")
+    if ladder_pcts is not None:
+        ladder_pcts = [int(pct) for pct in ladder_pcts]
+    targets = build_targets(ctx_size, ladder_pcts)
+    cache_prompt = bool(profile.get("cache_prompt", True))
     telemetry_stop = threading.Event()
     telemetry = None
     process = None
@@ -839,7 +1111,10 @@ def main():
     report = {
         "run_id": run_id,
         "started_at": started_at,
-        "status": "ok",
+        "status": STATUS_OK,
+        "status_reasons": [],
+        "invariants_failed": False,
+        "non_comparable_was_flagged": False,
         "error": None,
         "profile": profile["name"],
         "profile_path": str(profile_path),
@@ -855,11 +1130,12 @@ def main():
         "parallel": int(profile.get("parallel", 1)),
         "cache_type_k": profile.get("cache_type_k"),
         "cache_type_v": profile.get("cache_type_v"),
+        "cache_prompt": cache_prompt,
         "n_predict": int(profile.get("n_predict", 128)),
         "seed": args.seed,
         "port": port,
         "targets": targets,
-        "ladder_pcts": list(LADDER_PCTS),
+        "ladder_pcts": [target["target_pct"] for target in targets[1:]],
         "telemetry_csv": "telemetry.csv",
         "steps": [],
     }
@@ -883,13 +1159,42 @@ def main():
                 report["smoke"] = smoke
                 smoke.update(run_smoke(base_url, profile))
                 smoke["gpu_after"] = smoke_gpu_snapshot()
-            elif args.mode == "ladder":
-                report["steps"] = run_ladder(base_url, profile, targets, args.seed, result_dir / "server.log")
             else:
-                report.update(run_ab_sequence(base_url, profile, targets, args.order, args.seed, result_dir / "server.log"))
+                props_check = check_props(snapshot_props(base_url), ctx_size, report["parallel"])
+                report["props_check"] = props_check
+                if not props_check["ok"]:
+                    # Fail closed: a mismatched /props makes every later step
+                    # non-comparable, so skip the heavy ladder/ab requests and
+                    # keep `steps` empty; result.json still carries the reason.
+                    mark_non_comparable(report, props_check["reasons"])
+                    report["measurement_skipped"] = "props_check_failed"
+                else:
+                    if args.mode == "ladder":
+                        run_ladder(
+                            base_url, profile, targets, args.seed, result_dir / "server.log",
+                            report["steps"], cache_prompt,
+                        )
+                    else:
+                        report["order"] = args.order
+                        run_ab_sequence(
+                            base_url, profile, targets, args.order, args.seed, result_dir / "server.log",
+                            report["steps"], cache_prompt,
+                        )
+                    log_path = result_dir / "server.log"
+                    log_text = (
+                        log_path.read_text(encoding="utf-8", errors="replace")
+                        if log_path.exists() else ""
+                    )
+                    offload_check = check_offload(log_text)
+                    report["offload_check"] = offload_check
+                    mark_non_comparable(report, offload_check["reasons"])
     except Exception as exc:  # noqa: BLE001
-        report["status"] = "failed"
+        report["status"] = classify_status(exc)
         report["error"] = str(exc)
+        report["status_reasons"].append(exception_reason(
+            report["status"],
+            f"{report['status']}: {exc}",
+        ))
         raise
     finally:
         telemetry_stop.set()

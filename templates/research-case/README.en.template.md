@@ -61,13 +61,25 @@ collection. The general methodology is in
 FILL IN: summary table over the canonical runs. Sources —
 `docs/results-tables.md` (human-readable tables) and `docs/results.json`
 (machine-readable summary with canonical/control runs); raw runs —
-`results/<run_id>/`. The canonical result is the aggregate over **n ≥ 3**
-successful runs (**median + min/max**, with `n` and the list of `run_id`s
-recorded); at `n < 3` the result is marked limited/non-canonical. The norm is in
+`results/<run_id>/`. The canonical result is the aggregate over repetitions
+**per step** (per-step canonicality): a step enters only when it is comparable
+(`completion_is_fixed` + `finish_reason = length` + `step_comparable`) and has
+**n ≥ 3** unique `ok` runs (**median + min/max**, with `n` and the list of
+`run_id`s recorded); steps with `n < 3` are marked `limited` and shown
+separately, outside the main tables/figures. The generation status of a run is
+`fixed`/`mixed`/`variable`. The norm is in
 [METHODOLOGY.md](../../METHODOLOGY.md) §11.1 (for the skeleton; after copying the
 case the path is `../methodology/METHODOLOGY.md`). Mark derived values
 (percentages, deltas) as **computed**, and keep interpretation separate from
 facts.
+
+When an A/B series exists, report the paired A/B delta (delta = 100·(B−A)/A over
+the matching steps, median delta, `n_pairs`, `sign_consistency`) from the report
+and `docs/results.json` (`ab_delta`, key `"profile|order"`). When power telemetry
+exists, give the step energy estimate (J/request = `energy_j`, J/output-token
+from `telemetry.csv`; the report's "Energy and power" section), marked as an
+**estimate**; without power telemetry this is not a blocker — record an explicit
+"no data".
 
 ## Figures
 
