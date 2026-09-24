@@ -1,0 +1,56 @@
+# Model weights are never committed: publish URL + sha256 only.
+data/models/
+models/
+*.gguf
+*.safetensors
+
+# Runtimes and build trees are reproducible from source; do not commit binaries.
+# Binary patterns are scoped to build/runtime directories so they do not mask
+# small text artefacts elsewhere in the tree.
+tools/llama-cpp/
+llama.cpp/runtime/
+llama.cpp/src/
+llama.cpp/runtime-*/
+llama.cpp/src/build/
+llama.cpp/src/build-*/
+dist/
+build/
+dist/**/*.o
+dist/**/*.so
+dist/**/*.so.*
+dist/**/*.a
+build/**/*.o
+build/**/*.so
+build/**/*.so.*
+build/**/*.a
+tools/**/*.o
+tools/**/*.so
+tools/**/*.so.*
+tools/**/*.a
+
+# Raw benchmark runs ARE committed (published after sanitizing), so results/
+# is not ignored by default. Unsanitized local drafts live in results.local/
+# and are never committed. Before committing, sanitize results with the case's
+# own sanitize-results.sh (copied from methodology/scripts/publish/ into
+# scripts/; see scripts/README.md) -- the skeleton does not ship that script.
+results.local/
+
+# The study config (study.json) is tracked: it is published metadata for the
+# report/figures and is intentionally absent from this ignore list.
+
+# Python cache and bytecode.
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Local virtual environments and caches.
+.venv/
+venv/
+.cache/
+
+# Temporary and editor files.
+*.tmp
+*.swp
+*~
+.DS_Store

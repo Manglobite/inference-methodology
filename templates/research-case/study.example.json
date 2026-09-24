@@ -1,0 +1,22 @@
+{
+  "_note": "Study configuration for scripts/report/generate_report.py and scripts/report/plot_context_curves.py. Replace every <...> placeholder and delete this _note. Copy this file to <case>/study.json (the aggregators look for ./study.json by default; --config overrides the path). title is the study title shown in the report header and figure captions. profiles lists every variant: name must match run['profile'] in results/<run_id>/result.json; label is the bilingual caption; role is 'main' (main series) or 'control' (control/workaround series, rendered as a separate report section and drawn dashed on the figures). ab_planned lists the profiles for which the A/B cache series is required. ab_orders lists the expected A/B request orders; ladder_pcts lists the context-fill steps (percent of ctx) that the ladder is expected to cover. All four lists are optional: when omitted (or when the file is absent) the scripts auto-detect profiles, orders and steps from the raw runs (all profiles become 'main').",
+  "title": {
+    "ru": "<название исследования>",
+    "en": "<study title>"
+  },
+  "profiles": [
+    {
+      "name": "<profile-name>",
+      "label": {"ru": "<подпись профиля>", "en": "<profile label>"},
+      "role": "main"
+    },
+    {
+      "name": "<profile-name-control>",
+      "label": {"ru": "<подпись контроля>", "en": "<control label>"},
+      "role": "control"
+    }
+  ],
+  "ab_planned": ["<profile-name-main>"],
+  "ab_orders": ["ABAB", "ABBABAA"],
+  "ladder_pcts": [10, 30, 60, 80]
+}
